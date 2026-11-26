@@ -1,0 +1,509 @@
+---
+title: "Project 2026 – Part 1: Explore, preprocess and quality-control the data"
+subtitle: "GSE80655 (Ramaker et al., 2017, Genome Medicine)"
+date: "2026-11-19"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+---
+
+<!--
+  Changes compared with version 1 are marked in the code with
+  "# CHANGED:" or "# ADDED:" so they are easy to find.
+  The analysis itself and its order are unchanged.
+-->
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE, fig.align = "center",
+                      fig.width = 8, fig.height = 5)
+```
+
+# 0. Packages
+
+```{r packages}
+# CHANGED: installation lines commented out, otherwise everything is reinstalled at every Knit.
+# Run them once in the console if a package is missing.
+# install.packages(c("tidyverse", "pheatmap", "patchwork"))
+# BiocManager::install(c("DESeq2", "edgeR", "limma", "EnsDb.Hsapiens.v75"))
+
+library(tidyverse)
+library(DESeq2)
+library(edgeR)
+library(limma)
+library(pheatmap)
+library(patchwork)
+
+set.seed(2026)
+dir.create("figures", showWarnings = FALSE)
+```
+
+# 1. Read the data
+
+```{r read}
+# CHANGED: relative paths, so the script works on every computer.
+# The two csv files must be in the same folder as this .Rmd file.
+counts_raw <- read.csv("GSE80655_counts.csv",   check.names = FALSE)
+meta_raw   <- read.csv("GSE80655_metadata.csv", check.names = FALSE,
+                       stringsAsFactors = FALSE)
+
+# Counts: first column = gene IDs, keep only numeric (sample) columns
+gene_ids <- as.character(counts_raw[[1]])
+is_num   <- vapply(counts_raw, is.numeric, logical(1))
+counts   <- as.matrix(counts_raw[, is_num, drop = FALSE])
+rownames(counts) <- make.unique(sub("\\..*$", "", gene_ids))  # drop ENSG version suffix
+
+# If genes ended up as columns, transpose (genes should be rows)
+if (nrow(counts) < ncol(counts)) counts <- t(counts)
+```
+
+# Q1. How many samples and features? What type is each variable?
+
+```{r q1}
+dim(counts)                       # paper: 57,905 genes x 281 samples
+dim(meta_raw)
+str(meta_raw)
+head(counts[, 1:5])
+
+# Are counts raw integers? (needed for DESeq2)
+all(counts == round(counts))
+range(counts)
+
+# Find the metadata column whose values match the count-matrix column names
+id_col <- names(meta_raw)[vapply(meta_raw,
+            function(x) mean(colnames(counts) %in% as.character(x)) > 0.9,
+            logical(1))][1]
+id_col
+
+col_map <- c(sample    = id_col,
+             region    = "brain_region",        # AnCg / DLPFC / nAcc
+             diagnosis = "diagnosis",           # Control / Major Depression / Bipolar Disorder / Schizophrenia
+             age       = "age",
+             sex       = "sex",
+             ph        = "brain_pH",
+             pmi       = "PMI",
+             race      = "ethnicity",
+             donor     = "donor_id")            # subject ID
+
+meta <- meta_raw %>% select(any_of(col_map))    # renames + drops missing ones
+
+# Recode empty strings / text placeholders as real NAs
+meta <- meta %>% mutate(across(where(is.character),
+          ~ na_if(na_if(na_if(trimws(.x), ""), "NA"), "unknown")))
+
+# Variable types
+meta <- meta %>% mutate(
+  region    = factor(region),
+  diagnosis = factor(diagnosis),
+  sex       = factor(sex),
+  across(any_of(c("race", "donor")), factor),
+  across(any_of(c("age", "ph", "pmi")), as.numeric))
+
+meta$diagnosis <- relevel(meta$diagnosis,
+                          ref = grep("ctl|control", levels(meta$diagnosis),
+                                     ignore.case = TRUE, value = TRUE)[1])
+
+# Align metadata rows with count columns
+meta   <- meta[match(colnames(counts), meta$sample), ]
+stopifnot(identical(meta$sample, colnames(counts)))
+rownames(meta) <- meta$sample
+
+# Overview tables
+summary(meta)
+table(meta$region, meta$diagnosis)
+table(meta$diagnosis, meta$sex)
+
+n_distinct(meta$donor)                 # paper: 96 donors
+table(table(meta$donor))               # how many regions per donor
+
+# ADDED: one row per donor, used for all donor-level tests below
+donors <- meta %>% distinct(donor, .keep_all = TRUE)
+nrow(donors)
+```
+
+**Interpretation.** The count matrix contains 57,905 genes × 281 samples of raw integer counts. Variable types: *diagnosis*, *region*, *sex*, *race* and *donor* are nominal; *age*, *pH* and *PMI* are continuous. There are 96 donors (24 per diagnosis) and most donors contributed tissue from all three regions, so **samples from the same donor are not independent**. Tests on donor-level variables are therefore done on one row per donor (`donors`), to avoid pseudoreplication.
+
+# Q2. Missing values: where, why, and how to handle
+
+```{r q2_map, fig.height = 4}
+sum(is.na(counts))                       # expect 0
+colSums(is.na(meta))
+
+# Visual map of missingness in the metadata
+# CHANGED: plot stored in an object and printed, so it also appears in the HTML report
+p_miss <- meta %>%
+  mutate(across(everything(), is.na)) %>%
+  rowid_to_column("row") %>%
+  pivot_longer(-row, names_to = "variable", values_to = "missing") %>%
+  ggplot(aes(variable, row, fill = missing)) +
+  geom_tile() +
+  scale_fill_manual(values = c(`FALSE` = "grey85", `TRUE` = "firebrick")) +
+  labs(title = "Missing values in metadata", y = "sample") +
+  theme_minimal() + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+print(p_miss)
+ggsave("figures/Q2_missingness.png", p_miss, width = 7, height = 5)
+```
+
+```{r q2_handle}
+# Which donor is missing pH?
+meta %>% filter(is.na(ph)) %>% select(sample, donor, region, diagnosis)
+
+# Is missingness related to diagnosis? (MCAR check)
+# CHANGED: tested per donor instead of per sample (one donor = 3 samples otherwise)
+for (v in c("age", "ph", "pmi")) if (v %in% names(donors) && any(is.na(donors[[v]]))) {
+  print(v); print(table(missing = is.na(donors[[v]]), donors$diagnosis))
+  print(fisher.test(table(is.na(donors[[v]]), donors$diagnosis)))
+}
+
+# "Structural" missingness: donors missing one or more brain regions
+meta %>%
+  dplyr::count(donor, region) %>%
+  tidyr::complete(donor, region, fill = list(n = 0)) %>%
+  dplyr::filter(n == 0) %>%
+  dplyr::left_join(dplyr::distinct(meta, donor, diagnosis), by = "donor")
+
+# Handling: impute numeric covariates with the overall median (NOT per diagnosis,
+# which would leak the outcome), and keep a flag so the choice is transparent.
+# CHANGED: median computed over donors, so donors with 3 samples do not count 3 times
+for (v in c("age", "ph", "pmi")) if (v %in% names(meta) && any(is.na(meta[[v]]))) {
+  meta[[paste0(v, "_imputed")]] <- is.na(meta[[v]])
+  meta[[v]][is.na(meta[[v]])]   <- median(donors[[v]], na.rm = TRUE)
+}
+donors <- meta %>% distinct(donor, .keep_all = TRUE)   # refresh with imputed values
+```
+
+**Interpretation.** The count matrix has no missing values. In the metadata only *brain pH* is missing, for one donor with schizophrenia (3 samples). With a single donor, missingness cannot be shown to depend on diagnosis, so we treat it as **MCAR** (missing completely at random). We impute the overall donor median rather than deleting the donor, because deletion reduces N and makes models with and without pH fit on different data. The flag `ph_imputed` keeps the choice visible. A few donors lack one brain region (structural missingness); this needs no imputation because analyses are done per region.
+
+# Q3. Samples or features that behave unlike the rest
+
+## 3a. Sample-level QC metrics
+
+```{r q3a, fig.height = 9}
+# ADDED: mitochondrial genes (Ensembl IDs of the 37 chrM genes all start with ENSG000002 and
+# are the last 37 rows of the matrix); a high mitochondrial fraction points to degraded tissue
+mt_genes <- tail(rownames(counts), 37)
+
+qc <- tibble(sample      = colnames(counts),
+             lib_size    = colSums(counts),
+             n_detected  = colSums(counts > 0),
+             pct_top100  = apply(counts, 2, function(x)
+                             sum(sort(x, decreasing = TRUE)[1:100]) / sum(x) * 100),
+             pct_mito    = colSums(counts[mt_genes, ]) / colSums(counts) * 100) %>%   # ADDED
+  left_join(meta, by = "sample")
+
+summary(qc$lib_size)
+summary(qc$pct_mito)
+
+p1 <- ggplot(qc, aes(region, lib_size / 1e6, colour = diagnosis)) +
+  geom_boxplot(outlier.shape = NA) + geom_jitter(width = .2, size = 1) +
+  labs(y = "Library size (millions)")
+p2 <- ggplot(qc, aes(region, n_detected, colour = diagnosis)) +
+  geom_boxplot(outlier.shape = NA) + geom_jitter(width = .2, size = 1) +
+  labs(y = "Genes with count > 0")
+p3 <- ggplot(qc, aes(region, pct_mito, colour = diagnosis)) +                         # ADDED
+  geom_boxplot(outlier.shape = NA) + geom_jitter(width = .2, size = 1) +
+  labs(y = "Mitochondrial reads (%)")
+p_qc <- p1 / p2 / p3
+print(p_qc)
+ggsave("figures/Q3_sample_qc.png", p_qc, width = 8, height = 9)
+
+# Flag samples > 3 MAD from the median on log library size / detected genes
+mad_out <- function(x) abs(x - median(x)) > 3 * mad(x)
+qc <- qc %>% mutate(flag_libsize  = mad_out(log10(lib_size)),
+                    flag_detected = mad_out(n_detected))
+qc %>% filter(flag_libsize | flag_detected) %>%
+  select(sample, region, diagnosis, lib_size, n_detected, pct_mito)
+
+# Is library size associated with diagnosis? (technical vs biology)
+kruskal.test(lib_size ~ diagnosis, data = qc)
+kruskal.test(pct_mito ~ diagnosis, data = qc)                                          # ADDED
+
+# ADDED: sample IDs (SLxxxx) seem to follow processing order; the SL58xx-SL60xx samples
+# have much smaller libraries, which suggests a separate sequencing batch
+qc <- qc %>% mutate(id_number = as.numeric(sub("SL", "", sample)),
+                    id_series = cut(id_number, c(0, 6100, 9000, Inf),
+                                    labels = c("SL58xx-SL60xx", "SL61xx-SL88xx", "SL3xxxx")))
+qc %>% group_by(id_series) %>%
+  summarise(n = n(), median_lib_M = median(lib_size) / 1e6)
+table(qc$id_series, qc$diagnosis)
+```
+
+**Interpretation.** Library size and mitochondrial fraction vary considerably between samples, so normalization is needed. Library size does not differ between diagnoses. Eleven samples are flagged by the 3-MAD rule. Most of them have either a very small library (the SL58xx–SL60xx samples, which look like a separate sequencing batch with lower depth) or an unusually high number of detected genes. That batch is spread over all four diagnoses, so it adds noise but is not confounded with diagnosis.
+
+## 3b. Sex check
+
+```{r q3b, fig.width = 6, fig.height = 4.5}
+sex_genes <- c(XIST = "ENSG00000229807", RPS4Y1 = "ENSG00000129824")
+if (all(sex_genes %in% rownames(counts))) {
+  cpm_all <- cpm(counts, log = TRUE, prior.count = 1)
+  sexdf <- tibble(sample = colnames(counts),
+                  XIST   = cpm_all[sex_genes["XIST"], ],
+                  RPS4Y1 = cpm_all[sex_genes["RPS4Y1"], ]) %>% left_join(meta, by = "sample")
+  # CHANGED: print() needed inside an if-block, otherwise the plot is not shown
+  p_sex <- ggplot(sexdf, aes(XIST, RPS4Y1, colour = sex)) + geom_point() +
+    labs(title = "Sex check: recorded sex vs sex-chromosome expression")
+  print(p_sex)
+  ggsave("figures/Q3_sex_check.png", p_sex, width = 6, height = 5)
+}
+```
+
+**Interpretation.** All samples recorded as female express *XIST* and lack *RPS4Y1*, and the reverse for males. Recorded sex matches the expression data for every sample, so there is no evidence of sample swaps.
+
+## 3c. Sample–sample correlation
+
+```{r q3c, fig.width = 9, fig.height = 8}
+logcpm_raw <- cpm(counts, log = TRUE, prior.count = 1)
+keep_tmp   <- rowMeans(logcpm_raw) > 1
+cor_mat    <- cor(logcpm_raw[keep_tmp, ], method = "spearman")
+ann <- data.frame(region = meta$region, diagnosis = meta$diagnosis, row.names = meta$sample)
+
+# CHANGED: heatmap drawn in the report and saved as a file
+pheatmap(cor_mat, annotation_col = ann, show_rownames = FALSE, show_colnames = FALSE,
+         main = "Sample-sample Spearman correlation")
+pheatmap(cor_mat, annotation_col = ann, show_rownames = FALSE, show_colnames = FALSE,
+         main = "Sample-sample Spearman correlation",
+         filename = "figures/Q3_cor_heatmap.png", width = 9, height = 8)
+
+# CHANGED: median correlation computed WITHIN each region. Across all regions, nAcc samples
+# always look less similar simply because nAcc differs from cortex.
+qc$median_cor <- NA_real_
+for (r in levels(meta$region)) {
+  idx <- which(meta$region == r)
+  sub <- cor_mat[idx, idx]
+  qc$median_cor[idx] <- apply(sub, 1, function(x) median(x[x < 1]))
+}
+qc <- qc %>% group_by(region) %>%
+  mutate(flag_cor = median_cor < quantile(median_cor, .25) - 1.5 * IQR(median_cor)) %>%   # IQR rule
+  ungroup()
+qc %>% filter(flag_cor) %>% arrange(donor) %>%
+  select(sample, donor, region, diagnosis, median_cor, pct_mito, ph)
+```
+
+**Interpretation.** Samples cluster first by region. Within each region, 30 samples fall below the IQR threshold (Q1 − 1.5 × IQR) of within-region correlation. Most of them come from patient groups (14 schizophrenia, 12 bipolar disorder, 2 depression, 2 controls), several donors are flagged in two or three regions (e.g. donors 3452, 4242 and 4404 in all three), and their mitochondrial fraction is clearly higher (median 27 % versus 16 % overall). This points to donor-level tissue quality (for example the circumstances of death) rather than a technical error in one sample.
+
+## 3d. Feature-level behaviour
+
+```{r q3d, fig.width = 6, fig.height = 4}
+gene_stats <- tibble(gene      = rownames(counts),
+                     total     = rowSums(counts),
+                     pct_zero  = rowMeans(counts == 0) * 100)
+sum(gene_stats$total == 0)                      # genes never detected
+p_gt <- ggplot(gene_stats, aes(log10(total + 1))) + geom_histogram(bins = 80) +
+  labs(title = "Total counts per gene", x = "log10(total count + 1)")
+print(p_gt)
+ggsave("figures/Q3_gene_totals.png", p_gt, width = 6, height = 4)
+gene_stats %>% arrange(desc(total)) %>% head(20)  # dominating genes (MT-, rRNA?)
+```
+
+# Q4. Pre-processing: annotation, filtering, normalization, transformation
+
+## 4a. Remove X/Y-chromosome genes
+
+```{r q4a}
+if (requireNamespace("EnsDb.Hsapiens.v75", quietly = TRUE)) {   # = GRCh37 E75, as in paper
+  gi  <- ensembldb::genes(EnsDb.Hsapiens.v75::EnsDb.Hsapiens.v75)
+  chr <- as.character(GenomicRanges::seqnames(gi))[match(rownames(counts), gi$gene_id)]
+  print(table(chr %in% c("X", "Y")))
+  counts_auto <- counts[!(chr %in% c("X", "Y")), ]
+} else {
+  # CHANGED: warn instead of silently skipping this step
+  message("EnsDb.Hsapiens.v75 not installed: X/Y genes were NOT removed")
+  counts_auto <- counts
+}
+dim(counts_auto)
+```
+
+## 4b. Outlier samples
+
+```{r q4b}
+# Decision: no samples are removed (see interpretation below).
+drop_samples <- character(0)
+counts_qc <- counts_auto[, !colnames(counts_auto) %in% drop_samples]
+meta_qc   <- droplevels(meta[colnames(counts_qc), ])
+```
+
+**Decision.** We keep all samples. The flagged samples come mainly from patient groups and cluster by donor, so removing them could bias the patient groups towards the "best-preserved" brains. Their technical variation is handled instead by including quality covariates (pH, RNA quality) in the models of Parts 2–4. A sensitivity analysis without these donors can show whether conclusions depend on them.
+
+## 4c. Filtering
+
+```{r q4c, fig.width = 9, fig.height = 4}
+# Filter lowly expressed genes (edgeR::filterByExpr, grouped by region x diagnosis)
+# ADDED NOTE: this filter uses the group labels. That is fine for exploration, but Part 3
+# requires a filter that does NOT depend on the labels (e.g. CPM >= 1 in >= 10 samples).
+grp  <- interaction(meta_qc$region, meta_qc$diagnosis)
+keep <- filterByExpr(counts_qc, group = grp, min.count = 10)
+table(keep)
+counts_f <- counts_qc[keep, ]
+
+# Before/after density plot of log-CPM
+dens <- function(m, lab) as_tibble(cpm(m, log = TRUE, prior.count = 1)[, 1:30]) %>%
+  pivot_longer(everything()) %>% mutate(step = lab)
+p_filt <- bind_rows(dens(counts_qc, "before filtering"), dens(counts_f, "after filtering")) %>%
+  ggplot(aes(value, group = name)) + geom_density(alpha = .3) + facet_wrap(~step) +
+  labs(x = "log2 CPM", title = "Effect of low-count filtering (30 samples shown)")
+print(p_filt)
+ggsave("figures/Q4_filtering.png", p_filt, width = 9, height = 4)
+```
+
+## 4d. Normalization and transformation
+
+```{r q4d, fig.width = 9, fig.height = 4}
+# Normalization (DESeq2 median-of-ratios) + variance-stabilizing transform
+dds <- DESeqDataSetFromMatrix(countData = round(counts_f), colData = meta_qc,
+                              design = ~ region + diagnosis)
+dds <- estimateSizeFactors(dds)
+summary(sizeFactors(dds))
+plot(sizeFactors(dds), colSums(counts_f) / 1e6,
+     xlab = "DESeq2 size factor", ylab = "Library size (M)")
+
+vsd <- vst(dds, blind = TRUE)          # blind = TRUE: unbiased by design for QC
+vmat <- assay(vsd)
+
+# Mean-variance before/after transformation
+raw_norm <- counts(dds, normalized = TRUE)
+mv <- bind_rows(
+  tibble(mean = rowMeans(log2(raw_norm + 1)), sd = rowSds(log2(raw_norm + 1)), data = "log2(norm + 1)"),
+  tibble(mean = rowMeans(vmat), sd = rowSds(vmat), data = "VST"))
+p_mv <- ggplot(mv, aes(rank(mean), sd)) + geom_point(alpha = .05, size = .3) +
+  geom_smooth(colour = "red") + facet_wrap(~data) + labs(x = "rank(mean)")
+print(p_mv)
+ggsave("figures/Q4_mean_sd.png", p_mv, width = 9, height = 4)
+
+# Boxplots of samples: raw vs normalized + transformed
+p_box <- bind_rows(
+  as_tibble(log2(counts_f[, 1:40] + 1)) %>% pivot_longer(everything()) %>% mutate(step = "log2 raw"),
+  as_tibble(vmat[, 1:40]) %>% pivot_longer(everything()) %>% mutate(step = "VST normalized")) %>%
+  ggplot(aes(name, value)) + geom_boxplot(outlier.shape = NA) + facet_wrap(~step, ncol = 1) +
+  theme(axis.text.x = element_blank()) + labs(x = "sample (first 40)")
+print(p_box)
+ggsave("figures/Q4_boxplots.png", p_box, width = 9, height = 6)
+```
+
+**Interpretation.** Filtering removes genes that are (almost) never detected; they carry no information and every extra gene is an extra test later on. Size factors correct for differences in sequencing depth. After VST, the standard deviation no longer depends on the mean expression, which is what PCA and clustering assume, and the sample distributions become comparable.
+
+# Q5. Do samples cluster by biology or by a technical factor?
+
+```{r q5_fun}
+run_pca <- function(mat, md, ntop = 500) {
+  sel <- head(order(rowVars(mat), decreasing = TRUE), ntop)
+  pc  <- prcomp(t(mat[sel, ]))
+  list(pc = pc, var = round(100 * pc$sdev^2 / sum(pc$sdev^2), 1),
+       df = bind_cols(md, as_tibble(pc$x[, 1:10])))
+}
+```
+
+## 5a. All samples
+
+```{r q5a, fig.width = 11, fig.height = 8}
+pca_all <- run_pca(vmat, meta_qc %>% left_join(select(qc, sample, lib_size, n_detected, pct_mito), by = "sample"))
+
+# ADDED: scree plot, to judge how many PCs are worth interpreting
+p_scree <- tibble(PC = 1:15, var = pca_all$var[1:15]) %>%
+  ggplot(aes(PC, var)) + geom_col() + geom_line() + geom_point() +
+  labs(y = "Variance explained (%)", title = "Scree plot")
+
+pa <- ggplot(pca_all$df, aes(PC1, PC2, colour = region)) + geom_point() +
+  labs(x = paste0("PC1 (", pca_all$var[1], "%)"), y = paste0("PC2 (", pca_all$var[2], "%)"))
+pb <- ggplot(pca_all$df, aes(PC1, PC2, colour = diagnosis)) + geom_point()
+pc_ <- ggplot(pca_all$df, aes(PC1, PC2, colour = log10(lib_size))) + geom_point() +
+  scale_colour_viridis_c()
+pd <- ggplot(pca_all$df, aes(PC1, PC2, colour = sex)) + geom_point()
+p_pca <- (pa | pb) / (pc_ | pd)
+print(p_scree)
+print(p_pca)
+ggsave("figures/Q5_pca_all.png", p_pca, width = 11, height = 8)
+```
+
+## 5b. Association of top PCs with every covariate
+
+```{r q5b, fig.width = 8, fig.height = 4.5}
+covs <- intersect(c("region", "diagnosis", "sex", "race", "age", "ph", "pmi",
+                    "lib_size", "n_detected", "pct_mito"), names(pca_all$df))      # CHANGED: + pct_mito
+assoc <- expand_grid(PC = paste0("PC", 1:10), cov = covs) %>%
+  rowwise() %>%
+  mutate(p = {
+    x <- pca_all$df[[cov]]; y <- pca_all$df[[PC]]
+    if (is.numeric(x)) cor.test(x, y, method = "spearman", exact = FALSE)$p.value
+    else kruskal.test(y ~ factor(x))$p.value
+  }) %>% ungroup() %>% mutate(PC = factor(PC, paste0("PC", 1:10)))
+p_assoc <- ggplot(assoc, aes(PC, cov, fill = -log10(p))) + geom_tile() +
+  geom_text(aes(label = ifelse(p < 0.05, "*", "")), size = 5) +
+  scale_fill_viridis_c() + labs(title = "PC-covariate association (* p < 0.05)", y = NULL)
+print(p_assoc)
+ggsave("figures/Q5_pc_covariate_assoc.png", p_assoc, width = 8, height = 4.5)
+```
+
+**Interpretation.** PC1 separates nucleus accumbens from the two cortical regions: **region is by far the largest source of variation**. The next PCs are associated with sex (PC2, driven by X/Y genes if these were not removed in 4a) and with tissue-quality variables (mitochondrial fraction, pH, number of detected genes), while diagnosis is only weakly associated with PC2 and PC3. The disease effect is therefore small compared with other sources of variation. Analyses should be done per region, with pH and RNA quality as covariates.
+
+## 5c. Within each region
+
+```{r q5c, fig.width = 14, fig.height = 4.5}
+plots <- lapply(levels(meta_qc$region), function(r) {
+  idx <- meta_qc$region == r
+  p   <- run_pca(vmat[, idx], meta_qc[idx, ])
+  ggplot(p$df, aes(PC1, PC2, colour = diagnosis)) + geom_point() +
+    stat_ellipse(level = .68) +
+    labs(title = r, x = paste0("PC1 (", p$var[1], "%)"), y = paste0("PC2 (", p$var[2], "%)"))
+})
+p_reg <- wrap_plots(plots, ncol = 3)
+print(p_reg)
+ggsave("figures/Q5_pca_by_region.png", p_reg, width = 14, height = 4.5)
+```
+
+## 5d. Hierarchical clustering
+
+```{r q5d, fig.width = 10, fig.height = 8}
+# Ward linkage on Euclidean distance, as in the paper
+sel <- head(order(rowVars(vmat), decreasing = TRUE), 1000)
+hc  <- hclust(dist(t(vmat[sel, ])), method = "ward.D2")
+pheatmap(vmat[sel, ], scale = "row", cluster_cols = hc, annotation_col = ann[colnames(vmat), ],
+         show_rownames = FALSE, show_colnames = FALSE,
+         main = "Top 1000 variable genes (row z-scores)")
+pheatmap(vmat[sel, ], scale = "row", cluster_cols = hc, annotation_col = ann[colnames(vmat), ],
+         show_rownames = FALSE, show_colnames = FALSE,
+         main = "Top 1000 variable genes (row z-scores)",
+         filename = "figures/Q5_heatmap_clusters.png", width = 10, height = 8)
+table(cluster = cutree(hc, k = 3), region = meta_qc$region)
+```
+
+## 5e. Visualisation-only correction for technical covariates
+
+```{r q5e, fig.width = 7, fig.height = 5}
+# (Never feed these corrected values into DESeq2 — covariates go in the design.)
+tech <- model.matrix(~ scale(log(colSums(counts_f))) + ph + pmi + age, data = meta_qc)[, -1]
+vmat_corr <- removeBatchEffect(vmat, covariates = tech,
+                               design = model.matrix(~ region + diagnosis, meta_qc))
+pca_corr <- run_pca(vmat_corr, meta_qc)
+p_corr <- ggplot(pca_corr$df, aes(PC1, PC2, colour = region, shape = diagnosis)) + geom_point() +
+  labs(title = "PCA after regressing out technical covariates (visualisation only)")
+print(p_corr)
+ggsave("figures/Q5_pca_corrected.png", p_corr, width = 7, height = 5)
+```
+
+**Interpretation.** Hierarchical clustering recovers the brain regions but not the diagnoses, consistent with the PCA. Within a region, diagnosis groups overlap strongly. This does not mean there are no differences, but that they are limited to a small number of genes. Those are tested gene by gene in Part 3.
+
+# Q6. Is the preprocessed dataset suitable for the next parts?
+
+```{r q6}
+# Design balance per region (power) and confounding of covariates with diagnosis
+table(meta_qc$region, meta_qc$diagnosis)
+
+# CHANGED: tests per donor instead of per sample, to avoid pseudoreplication.
+# (Per sample, sex vs diagnosis gives p ~ 0.002; per donor it is not significant.)
+donors_qc <- meta_qc %>% distinct(donor, .keep_all = TRUE)
+for (v in intersect(c("age", "ph", "pmi"), names(donors_qc)))
+  print(c(v, signif(kruskal.test(donors_qc[[v]] ~ donors_qc$diagnosis)$p.value, 3)))
+fisher.test(table(donors_qc$diagnosis, donors_qc$sex))
+
+# Save the analysis-ready objects
+saveRDS(list(counts = counts_f, meta = meta_qc, qc = qc, dds = dds, vsd = vsd),
+        "GSE80655_preprocessed.rds")
+sessionInfo()
+```
+
+**Conclusion of Part 1.** The data are suitable for the next parts, with three consequences:
+
+1. **Analyse per region.** Region dominates the variation, and within one region every donor occurs only once, which avoids pseudoreplication.
+2. **Adjust for brain pH and RNA quality.** pH differs between diagnosis groups and, together with the mitochondrial fraction, drives the main technical PCs.
+3. **Expect small effects.** Diagnosis does not drive any major PC, so effects per gene will be small and multiple-testing correction will be strict.

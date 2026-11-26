@@ -27,10 +27,10 @@ dir.create("figures", showWarnings = FALSE)
 
 
 ## ---- 1. Read the data -------------------------------------------------------
-counts_raw <- read.csv("/Users/kathykorasak/Data/GSE80655_counts.csv",   check.names = FALSE)
-meta_raw   <- read.csv("/Users/kathykorasak/Data/GSE80655_metadata.csv", check.names = FALSE,
+counts_raw <- read.csv("/Users/victoria/Documents/GitHub/Group 35/Data/GSE80655_counts.csv",   check.names = FALSE)
+meta_raw   <- read.csv("/Users/victoria/Documents/GitHub/Group 35/Data/GSE80655_metadata.csv", check.names = FALSE,
                        stringsAsFactors = FALSE)
-
+getwd()
 # Counts: first column = gene IDs, keep only numeric (sample) columns
 gene_ids <- as.character(counts_raw[[1]])
 is_num   <- vapply(counts_raw, is.numeric, logical(1))
