@@ -1,0 +1,307 @@
+---
+title: "Project 2026 – Part 2: Formulate and test your own research question"
+subtitle: "GABAergic genes and EGR1 in schizophrenia versus bipolar disorder (AnCg)"
+date: "2026-11-26"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE, fig.align = "center",
+                      fig.width = 8, fig.height = 4.5)
+```
+
+**Goal (from the assignment).** After exploring and preprocessing the data (Part 1), formulate one original research question with a matching hypothesis, test it with an appropriate statistical analysis, visualize the result, and draw a conclusion.
+
+# Packages and data
+
+```{r packages}
+library(tidyverse)
+library(SummarizedExperiment)   # assay() for the VST object from Part 1
+library(car)                    # vif()
+library(patchwork)
+
+# Same colours for the two diagnoses in every figure of the report
+diag_cols <- c("Bipolar Disorder" = "#2f6fd0", "Schizophrenia" = "#c2412d")
+theme_set(theme_bw(base_size = 12))
+dir.create("figures", showWarnings = FALSE)
+```
+
+```{r data}
+# Analysis-ready objects from Part 1 (filtered, normalized, VST-transformed)
+pre  <- readRDS("GSE80655_preprocessed.rds")
+vmat <- assay(pre$vsd)
+meta <- pre$meta %>%
+  left_join(select(pre$qc, sample, pct_mito), by = "sample")
+
+genes <- c(GAD1 = "ENSG00000128683", GAD2 = "ENSG00000136750", EGR1 = "ENSG00000120738")
+
+# Subset: AnCg, schizophrenia vs bipolar disorder
+dat <- meta %>%
+  filter(region == "AnCg", diagnosis %in% c("Schizophrenia", "Bipolar Disorder")) %>%
+  mutate(diagnosis = factor(diagnosis, levels = c("Bipolar Disorder", "Schizophrenia")),
+         sz = as.integer(diagnosis == "Schizophrenia"))          # outcome: 1 = SZ, 0 = BPD
+dat <- bind_cols(dat, as_tibble(t(vmat[genes, dat$sample]), .name_repair = "minimal") %>%
+                   setNames(names(genes)))
+```
+
+**Why VST values from Part 1?** They are normalized for library size and variance-stabilized, so a one-unit difference means the same across the expression range. Using the same object as in Part 1 keeps the report consistent.
+
+# Research question and hypothesis
+
+**Research question.** Is the combined expression of GABAergic genes (*GAD1*, *GAD2*) and *EGR1* associated with diagnosis (schizophrenia versus bipolar disorder) in the anterior cingulate cortex, after adjusting for age, sex, brain pH and RNA quality?
+
+**Why this question?** Ramaker et al. (2017) reported reduced *EGR1* expression in schizophrenia and disrupted GABA metabolism (correlated with *GAD1*/*GAD2* expression), but they compared each disorder with controls only. Schizophrenia and bipolar disorder share symptoms (psychosis) and many molecular changes, so it is unknown whether these genes differ *between* the two disorders. The question is therefore driven by the literature, not by the data.
+
+**Hypotheses** (combined effect of the genes):
+
+- **H₀:** after adjustment for the covariates, GABAergic gene expression and *EGR1* together add no information about diagnosis.
+- **H₁:** at least one of them is associated with diagnosis.
+
+**Requirements of the assignment.**
+
+| Requirement | How it is met |
+|---|---|
+| Multivariable: one outcome and at least two explanatory variables | Outcome = diagnosis; explanatory = GABA score and *EGR1*, adjusted for age, sex, pH and RNA quality |
+| Testable with the data provided | All variables are available for the 48 donors (checked in Q2) |
+| Own question | Ramaker et al. never compared schizophrenia directly with bipolar disorder |
+
+# Guiding questions
+
+## Q1. What is the outcome, and what are the explanatory variables? Which type is each?
+
+| Role | Variable | Type |
+|---|---|---|
+| **Outcome** (dependent) | Diagnosis: schizophrenia (1) vs bipolar disorder (0) | binary |
+| **Explanatory, of interest** | GABA score (from *GAD1* and *GAD2*, see Q2) | continuous |
+| **Explanatory, of interest** | *EGR1* expression | continuous |
+| **Adjustment** | age, brain pH, RNA quality (% mitochondrial reads) | continuous |
+| **Adjustment** | sex | binary |
+
+## Q2. Which features and samples do you need, and are there enough of them?
+
+**Samples.** The AnCg samples of donors with schizophrenia or bipolar disorder.
+
+```{r q2_samples}
+stopifnot(!anyDuplicated(dat$donor))   # every donor occurs once -> independent observations
+table(dat$diagnosis)
+table(dat$diagnosis, dat$sex)
+```
+
+Within one region every donor contributes one sample, so the 48 observations are independent (no pseudoreplication). The AnCg is the region where Ramaker et al. found the strongest schizophrenia signal, including *EGR1*.
+
+**Features.** The three genes must be present after filtering and sufficiently expressed.
+
+```{r q2_features}
+genes %in% rownames(vmat)
+# Median log-CPM per gene (CPM computed on all genes, then the three genes selected)
+lcpm <- edgeR::cpm(pre$counts[, dat$sample], log = TRUE)
+round(apply(lcpm[genes, ], 1, median), 1) %>% setNames(names(genes))
+```
+
+All three genes are well expressed, so their measurements are reliable.
+
+**Are GAD1 and GAD2 separate features?**
+
+```{r q2_collinearity, fig.width = 5, fig.height = 4}
+round(cor(dat[, c("GAD1", "GAD2", "EGR1")]), 2)
+
+# Variance inflation factors if GAD1 and GAD2 are entered separately
+vif(glm(sz ~ GAD1 + GAD2 + EGR1 + age + sex + ph + pct_mito, family = binomial, data = dat))
+
+ggplot(dat, aes(GAD1, GAD2, colour = diagnosis)) + geom_point(size = 2) +
+  scale_colour_manual(values = diag_cols) + labs(title = "GAD1 vs GAD2 (VST)")
+```
+
+*GAD1* and *GAD2* are almost perfectly correlated, and with both in the model the variance inflation factor (VIF) is far above the usual limit of 5–10. The model then cannot separate their effects, and their odds ratios become unstable. Because both genes encode isoforms of the same enzyme (glutamate decarboxylase, which converts glutamate into GABA), we combine them into **one GABA score**: the mean of the standardized *GAD1* and *GAD2* values. This decision is based on the correlation between the predictors, not on their association with the outcome.
+
+```{r q2_score}
+z <- function(x) (x - mean(x)) / sd(x)
+dat <- dat %>%
+  mutate(GABA_score = (z(GAD1) + z(GAD2)) / 2,
+         # standardize continuous predictors: odds ratios are then "per standard deviation"
+         across(c(GABA_score, EGR1, age, ph, pct_mito), z, .names = "{.col}_z"))
+```
+
+**Are there enough samples?**
+
+```{r q2_epv}
+n_events <- min(table(dat$sz))
+n_params <- 6
+c(events = n_events, parameters = n_params, events_per_variable = round(n_events / n_params, 1))
+```
+
+A common rule of thumb asks for about 10 events per variable in logistic regression. With 24 schizophrenia cases and 6 predictors we have about 4. Estimates can therefore be somewhat unstable and confidence intervals will be wide. We keep all covariates because they were specified in the research question, and we check robustness with simpler models in the sensitivity analysis.
+
+## Q3. Which variables could confound the association, and are they available?
+
+```{r q3}
+# Do the covariates differ between schizophrenia and bipolar disorder? (one row per donor)
+tibble(variable = c("age", "brain pH", "PMI", "RNA quality (% mito)"),
+       p_wilcoxon = c(wilcox.test(age ~ diagnosis, data = dat)$p.value,
+                      wilcox.test(ph ~ diagnosis, data = dat)$p.value,
+                      wilcox.test(pmi ~ diagnosis, data = dat)$p.value,
+                      wilcox.test(pct_mito ~ diagnosis, data = dat)$p.value)) %>%
+  mutate(p_wilcoxon = signif(p_wilcoxon, 3))
+fisher.test(table(dat$diagnosis, dat$sex))$p.value
+```
+
+A confounder must be associated with both diagnosis and gene expression. Brain pH and RNA quality affect gene expression strongly (Part 1, PC associations), and age and sex are known to influence brain gene expression. Between schizophrenia and bipolar disorder these covariates do not differ significantly, so confounding is expected to be limited. We still adjust for them, because they were specified in advance and also explain variation in expression.
+
+**Not available:** medication (antipsychotics, lithium and other mood stabilizers), substance use and cause of death. Medication differs systematically between the two disorders and may influence gene expression, so it is a potential unmeasured confounder.
+
+## Q4. Which statistical model fits the outcome type, and what are its assumptions?
+
+The outcome is binary, so we use **multivariable logistic regression** (`glm(family = binomial)`):
+$$\text{logit}\, P(\text{SZ}) = \beta_0 + \beta_1\,\text{GABA} + \beta_2\,\text{EGR1} + \beta_3\,\text{age} + \beta_4\,\text{sex} + \beta_5\,\text{pH} + \beta_6\,\text{RNA quality}$$
+
+The hypothesis concerns the *combined* effect of the two genes, so it is tested with a **likelihood-ratio test (LRT)** that compares this model with the same model without the two genes (2 df). The LRT is also more reliable than separate Wald tests in small samples.
+
+**Assumptions** (checked after fitting, below):
+
+1. independent observations (guaranteed: one sample per donor);
+2. a linear relation between continuous predictors and the log-odds;
+3. no strong multicollinearity;
+4. enough events per variable (see Q2);
+5. no single observation that drives the fit.
+
+Normality of residuals is **not** an assumption of logistic regression.
+
+# Statistical test
+
+## Model fit and likelihood-ratio test
+
+```{r model}
+m_cov  <- glm(sz ~ age_z + sex + ph_z + pct_mito_z,                         family = binomial, data = dat)
+m_full <- glm(sz ~ GABA_score_z + EGR1_z + age_z + sex + ph_z + pct_mito_z, family = binomial, data = dat)
+summary(m_full)
+
+# Main test: combined effect of the GABA score and EGR1 (2 df)
+lrt <- anova(m_cov, m_full, test = "Chisq")
+lrt
+```
+
+## Effect sizes: odds ratios
+
+```{r or_table}
+# Odds ratios with 95% profile-likelihood confidence intervals
+or_tab <- tibble(term = names(coef(m_full)),
+                 OR   = exp(coef(m_full)),
+                 lower = exp(confint(m_full)[, 1]),
+                 upper = exp(confint(m_full)[, 2]),
+                 p_wald = summary(m_full)$coefficients[, 4]) %>%
+  filter(term != "(Intercept)") %>%
+  mutate(label = dplyr::recode(term, GABA_score_z = "GABA score (per SD)", EGR1_z = "EGR1 (per SD)",
+                        age_z = "Age (per SD)", sexM = "Sex: male vs female",
+                        ph_z = "Brain pH (per SD)", pct_mito_z = "RNA quality: % mito (per SD)"))
+or_tab %>% mutate(across(where(is.numeric), ~ signif(.x, 3)))
+
+# McFadden pseudo-R2: how much the genes add on top of the covariates
+mcf <- function(m) 1 - as.numeric(logLik(m)) / as.numeric(logLik(update(m, . ~ 1)))
+c(R2_covariates = round(mcf(m_cov), 3), R2_full = round(mcf(m_full), 3))
+```
+
+**Why odds ratios per standard deviation?** Gene expression and covariates are on different scales. Standardizing makes the odds ratios comparable: an OR of 0.5 for *EGR1* would mean that one standard deviation higher *EGR1* expression halves the odds of schizophrenia versus bipolar disorder, at equal values of the other variables. An OR of 1 means no association.
+
+## Checking the assumptions
+
+```{r linearity}
+# Linearity of the logit: does adding a quadratic term improve the model? (LRT per predictor)
+sapply(c("GABA_score_z", "EGR1_z", "age_z", "ph_z", "pct_mito_z"), function(v) {
+  m_q <- update(m_full, as.formula(paste(". ~ . + I(", v, "^2)")))
+  signif(anova(m_full, m_q, test = "Chisq")$`Pr(>Chi)`[2], 3)
+})
+
+# Multicollinearity in the final model
+vif(m_full)
+```
+
+```{r influence, fig.width = 7, fig.height = 3.5}
+# Influential observations
+infl <- tibble(sample = dat$sample, donor = dat$donor, diagnosis = dat$diagnosis,
+               cooks = cooks.distance(m_full))
+infl %>% arrange(desc(cooks)) %>% head(5)
+ggplot(infl, aes(seq_along(cooks), cooks, colour = diagnosis)) +
+  geom_point() + geom_hline(yintercept = 4 / nrow(dat), linetype = 2) +
+  scale_colour_manual(values = diag_cols) +
+  labs(x = "Observation", y = "Cook's distance", title = "Influential observations (dashed line = 4/n)")
+```
+
+**Result of the checks.** No quadratic term improves the model (all p > 0.1), so linearity of the logit is acceptable. After combining *GAD1* and *GAD2*, all VIFs are below 3. A few observations lie above the 4/n threshold for Cook's distance, but all values are far below 1, so no single donor dominates the fit.
+
+## Sensitivity analysis
+
+```{r sensitivity}
+fit_lrt <- function(d, covs) {
+  f0 <- as.formula(paste("sz ~", if (length(covs)) paste(covs, collapse = " + ") else "1"))
+  f1 <- update(f0, . ~ . + GABA_score_z + EGR1_z)
+  m0 <- glm(f0, family = binomial, data = d); m1 <- glm(f1, family = binomial, data = d)
+  tibble(n = nrow(d),
+         OR_GABA = exp(coef(m1)["GABA_score_z"]), OR_EGR1 = exp(coef(m1)["EGR1_z"]),
+         p_LRT = anova(m0, m1, test = "Chisq")$`Pr(>Chi)`[2])
+}
+all_covs <- c("age_z", "sex", "ph_z", "pct_mito_z")
+flagged  <- pre$qc %>% filter(flag_cor) %>% pull(donor) %>% unique()
+
+bind_rows(
+  "1. Main model"                          = fit_lrt(dat, all_covs),
+  "2. Unadjusted (genes only)"             = fit_lrt(dat, character(0)),
+  "3. Only pH and RNA quality"             = fit_lrt(dat, c("ph_z", "pct_mito_z")),
+  "4. Without donor with imputed pH"       = fit_lrt(filter(dat, !ph_imputed), all_covs),
+  "5. Without donors flagged in Part 1"    = fit_lrt(filter(dat, !donor %in% flagged), all_covs),
+  .id = "model") %>%
+  mutate(across(where(is.numeric), ~ signif(.x, 3)))
+```
+
+**Why?** With few events per variable and a few donors of doubtful tissue quality, it is important to show whether the conclusion depends on one modelling choice.
+
+**Result.** In all five models the combined test stays clearly non-significant (p ≈ 0.7) and the odds ratios stay close to 1, so the conclusion does not depend on the choice of covariates, the imputed pH value or the donors flagged in Part 1.
+
+# Visualisation
+
+```{r fig_genes, fig.width = 10, fig.height = 4}
+p_genes <- dat %>%
+  pivot_longer(c(GAD1, GAD2, EGR1), names_to = "gene", values_to = "expr") %>%
+  mutate(gene = factor(gene, levels = c("GAD1", "GAD2", "EGR1"))) %>%
+  ggplot(aes(diagnosis, expr, fill = diagnosis)) +
+  geom_boxplot(outlier.shape = NA, alpha = .6) + geom_jitter(width = .15, size = 1.2) +
+  facet_wrap(~gene, scales = "free_y") + scale_fill_manual(values = diag_cols) +
+  labs(x = NULL, y = "Expression (VST)", title = "Gene expression in the AnCg") +
+  theme(legend.position = "none")
+print(p_genes)
+ggsave("figures/P2_gene_boxplots.png", p_genes, width = 10, height = 4)
+```
+
+```{r fig_forest, fig.width = 7, fig.height = 3.8}
+p_forest <- ggplot(or_tab, aes(OR, fct_rev(factor(label, levels = label)))) +
+  geom_vline(xintercept = 1, linetype = 2) +
+  geom_errorbarh(aes(xmin = lower, xmax = upper), height = .2) +
+  geom_point(size = 3, colour = "#c2412d") +
+  scale_x_log10() +
+  labs(x = "Odds ratio for schizophrenia vs bipolar disorder (95% CI, log scale)", y = NULL,
+       title = "Multivariable logistic regression")
+print(p_forest)
+ggsave("figures/P2_forest_plot.png", p_forest, width = 7, height = 3.8)
+```
+
+**Why these two figures?** The boxplots show the raw data per group, so the reader can see the size of the overlap. The forest plot shows the result of the model: each odds ratio with its confidence interval, after adjustment. An interval that crosses the dashed line (OR = 1) is compatible with no association.
+
+# Conclusion
+
+```{r conclusion, echo = FALSE}
+p_main <- lrt$`Pr(>Chi)`[2]
+gaba <- or_tab %>% filter(term == "GABA_score_z"); egr1 <- or_tab %>% filter(term == "EGR1_z")
+```
+
+The likelihood-ratio test for the combined effect of the GABA score and *EGR1* gives **χ² = `r round(lrt$Deviance[2], 2)`, df = 2, p = `r signif(p_main, 3)`**. The odds ratio per standard deviation is `r round(gaba$OR, 2)` (95% CI `r round(gaba$lower, 2)`–`r round(gaba$upper, 2)`) for the GABA score and `r round(egr1$OR, 2)` (95% CI `r round(egr1$lower, 2)`–`r round(egr1$upper, 2)`) for *EGR1*.
+
+`r if (p_main < 0.05) "We therefore reject H0: after adjustment for age, sex, brain pH and RNA quality, GABAergic gene expression and/or EGR1 expression differ between schizophrenia and bipolar disorder in the AnCg." else "We therefore cannot reject H0: after adjustment for age, sex, brain pH and RNA quality, we find no evidence that GABAergic gene expression or EGR1 expression differ between schizophrenia and bipolar disorder in the AnCg. This does not prove that there is no difference: with 24 donors per group, only fairly large effects can be detected, and the wide confidence intervals are compatible with small to moderate effects in either direction. A plausible biological explanation is that the changes in these genes reported versus controls are shared by both disorders, rather than specific to schizophrenia."`
+
+**Limitations.** Few events per variable (about 4), post-mortem tissue, unknown medication (antipsychotics and mood stabilizers may affect expression), and no independent validation cohort.
+
+```{r session}
+sessionInfo()
+```
