@@ -1,0 +1,356 @@
+---
+title: "Project 2026"
+output: html_document
+date: "2026-11-19"
+---
+
+```{r setup}
+
+###############################################################################
+# GSE80655 (Ramaker et al. 2017, Genome Medicine)
+# PART 1 — Explore, preprocess and quality-control the data
+###############################################################################
+
+## ---- 0. Packages ------------------------------------------------------------
+install.packages(c("tidyverse", "pheatmap", "patchwork"))
+BiocManager::install(c("DESeq2", "edgeR", "limma", "EnsDb.Hsapiens.v75"))
+
+library(tidyverse)
+library(DESeq2)
+library(edgeR)
+library(limma)
+library(pheatmap)
+library(patchwork)
+
+set.seed(2026)
+dir.create("figures", showWarnings = FALSE)
+
+
+## ---- 1. Read the data -------------------------------------------------------
+counts_raw <- read.csv("/Users/kathykorasak/Data/GSE80655_counts.csv",   check.names = FALSE)
+meta_raw   <- read.csv("/Users/kathykorasak/Data/GSE80655_metadata.csv", check.names = FALSE,
+                       stringsAsFactors = FALSE)
+
+# Counts: first column = gene IDs, keep only numeric (sample) columns
+gene_ids <- as.character(counts_raw[[1]])
+is_num   <- vapply(counts_raw, is.numeric, logical(1))
+counts   <- as.matrix(counts_raw[, is_num, drop = FALSE])
+rownames(counts) <- make.unique(sub("\\..*$", "", gene_ids))  # drop ENSG version suffix
+
+# If genes ended up as columns, transpose (genes should be rows)
+if (nrow(counts) < ncol(counts)) counts <- t(counts)
+
+###############################################################################
+# Q1. How many samples and features? What type is each variable?
+###############################################################################
+dim(counts)                       # paper: 57,905 genes x 281 samples
+dim(meta_raw)
+str(meta_raw)
+head(counts[, 1:5])
+
+# Are counts raw integers? (needed for DESeq2)
+all(counts == round(counts))
+range(counts)
+
+# Find the metadata column whose values match the count-matrix column names
+id_col <- names(meta_raw)[vapply(meta_raw,
+            function(x) mean(colnames(counts) %in% as.character(x)) > 0.9,
+            logical(1))][1]
+id_col
+
+# ---- EDIT the right-hand sides to match names(meta_raw) --------------------
+names(meta_raw)
+
+col_map <- c(sample    = id_col,
+             region    = "brain_region",        # AnCg / DLPFC / nAcc
+             diagnosis = "diagnosis",           # Control / Major Depression / Bipolar Disorder / Schizophrenia
+             age       = "age",
+             sex       = "sex",
+             ph        = "brain_pH",
+             pmi       = "PMI",
+             race      = "ethnicity",
+             donor     = "donor_id")            # subject ID (if present)
+
+meta <- meta_raw %>% select(any_of(col_map))    # renames + drops missing ones
+
+# If there is no donor column, derive it from the sample title, e.g.
+# meta$donor <- sub("_(AnCg|DLPFC|nAcc).*$", "", meta_raw$title)
+
+# Recode empty strings / text placeholders as real NAs
+meta <- meta %>% mutate(across(where(is.character),
+          ~ na_if(na_if(na_if(trimws(.x), ""), "NA"), "unknown")))
+
+# Variable types
+meta <- meta %>% mutate(
+  region    = factor(region),
+  diagnosis = factor(diagnosis),
+  sex       = factor(sex),
+  across(any_of(c("race", "donor")), factor),
+  across(any_of(c("age", "ph", "pmi")), as.numeric))
+
+meta$diagnosis <- relevel(meta$diagnosis,
+                          ref = grep("ctl|control", levels(meta$diagnosis),
+                                     ignore.case = TRUE, value = TRUE)[1])
+
+# Align metadata rows with count columns
+meta   <- meta[match(colnames(counts), meta$sample), ]
+stopifnot(identical(meta$sample, colnames(counts)))
+rownames(meta) <- meta$sample
+
+# Overview tables
+summary(meta)
+table(meta$region, meta$diagnosis)
+table(meta$diagnosis, meta$sex)
+
+if ("donor" %in% names(meta)) {
+  n_distinct(meta$donor)                 # paper: 96 donors
+  table(table(meta$donor))               # how many regions per donor
+}
+
+
+###############################################################################
+# Q2. Missing values: where, why, and how to handle
+###############################################################################
+sum(is.na(counts))                       # expect 0
+colSums(is.na(meta))
+
+# Visual map of missingness in the metadata
+meta %>%
+  mutate(across(everything(), is.na)) %>%
+  rowid_to_column("row") %>%
+  pivot_longer(-row, names_to = "variable", values_to = "missing") %>%
+  ggplot(aes(variable, row, fill = missing)) +
+  geom_tile() +
+  scale_fill_manual(values = c(`FALSE` = "grey85", `TRUE` = "firebrick")) +
+  labs(title = "Missing values in metadata", y = "sample") +
+  theme_minimal() + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+ggsave("figures/Q2_missingness.png", width = 7, height = 5)
+
+# Is missingness related to diagnosis or region? (MCAR check)
+for (v in c("age", "ph", "pmi")) if (v %in% names(meta) && any(is.na(meta[[v]]))) {
+  print(v); print(table(missing = is.na(meta[[v]]), meta$diagnosis))
+  print(fisher.test(table(is.na(meta[[v]]), meta$diagnosis), simulate.p.value = TRUE))
+}
+
+# "Structural" missingness: donors missing one or more brain regions
+if ("donor" %in% names(meta)) {
+  meta %>%
+    dplyr::count(donor, region) %>%
+    tidyr::complete(donor, region, fill = list(n = 0)) %>%
+    dplyr::filter(n == 0) %>%
+    dplyr::left_join(
+      dplyr::distinct(meta, donor, diagnosis),
+      by = "donor"
+    )
+}
+# Handling: impute numeric covariates with the overall median (NOT per diagnosis,
+# which would leak the outcome), and keep a flag so the choice is transparent.
+for (v in c("age", "ph", "pmi")) if (v %in% names(meta) && any(is.na(meta[[v]]))) {
+  meta[[paste0(v, "_imputed")]] <- is.na(meta[[v]])
+  meta[[v]][is.na(meta[[v]])]   <- median(meta[[v]], na.rm = TRUE)
+}
+
+###############################################################################
+# Q3. Samples or features that behave unlike the rest
+###############################################################################
+## 3a. Sample-level QC metrics
+qc <- tibble(sample      = colnames(counts),
+             lib_size    = colSums(counts),
+             n_detected  = colSums(counts > 0),
+             pct_top100  = apply(counts, 2, function(x)
+                             sum(sort(x, decreasing = TRUE)[1:100]) / sum(x) * 100)) %>%
+  left_join(meta, by = "sample")
+
+summary(qc$lib_size)
+
+p1 <- ggplot(qc, aes(region, lib_size / 1e6, colour = diagnosis)) +
+  geom_boxplot(outlier.shape = NA) + geom_jitter(width = .2, size = 1) +
+  labs(y = "Library size (millions)")
+p2 <- ggplot(qc, aes(region, n_detected, colour = diagnosis)) +
+  geom_boxplot(outlier.shape = NA) + geom_jitter(width = .2, size = 1) +
+  labs(y = "Genes with count > 0")
+p1 / p2
+ggsave("figures/Q3_sample_qc.png", width = 8, height = 7)
+
+# Flag samples > 3 MAD from the median on log library size / detected genes
+mad_out <- function(x) abs(x - median(x)) > 3 * mad(x)
+qc <- qc %>% mutate(flag_libsize  = mad_out(log10(lib_size)),
+                    flag_detected = mad_out(n_detected))
+qc %>% filter(flag_libsize | flag_detected)
+
+# Is library size associated with diagnosis? (technical vs biology)
+kruskal.test(lib_size ~ diagnosis, data = qc)
+
+## 3b. Sex check — XIST (female) vs RPS4Y1 (male) before X/Y genes are removed
+sex_genes <- c(XIST = "ENSG00000229807", RPS4Y1 = "ENSG00000129824")
+if (all(sex_genes %in% rownames(counts))) {
+  cpm_all <- cpm(counts, log = TRUE, prior.count = 1)
+  sexdf <- tibble(sample = colnames(counts),
+                  XIST   = cpm_all[sex_genes["XIST"], ],
+                  RPS4Y1 = cpm_all[sex_genes["RPS4Y1"], ]) %>% left_join(meta, by = "sample")
+  ggplot(sexdf, aes(XIST, RPS4Y1, colour = sex)) + geom_point() +
+    labs(title = "Sex check: recorded sex vs sex-chromosome expression")
+  ggsave("figures/Q3_sex_check.png", width = 6, height = 5)
+}
+
+## 3c. Sample–sample correlation (on a quick log-CPM)
+logcpm_raw <- cpm(counts, log = TRUE, prior.count = 1)
+keep_tmp   <- rowMeans(logcpm_raw) > 1
+cor_mat    <- cor(logcpm_raw[keep_tmp, ], method = "spearman")
+qc$median_cor <- apply(cor_mat, 1, function(r) median(r[-which.max(r)]))
+ann <- data.frame(region = meta$region, diagnosis = meta$diagnosis, row.names = meta$sample)
+pheatmap(cor_mat, annotation_col = ann, show_rownames = FALSE, show_colnames = FALSE,
+         main = "Sample-sample Spearman correlation",
+         filename = "figures/Q3_cor_heatmap.png", width = 9, height = 8)
+qc %>% arrange(median_cor) %>% select(sample, region, diagnosis, median_cor) %>% head(10)
+
+## 3d. Feature-level behaviour
+gene_stats <- tibble(gene      = rownames(counts),
+                     total     = rowSums(counts),
+                     pct_zero  = rowMeans(counts == 0) * 100)
+sum(gene_stats$total == 0)                      # genes never detected
+ggplot(gene_stats, aes(log10(total + 1))) + geom_histogram(bins = 80) +
+  labs(title = "Total counts per gene", x = "log10(total count + 1)")
+ggsave("figures/Q3_gene_totals.png", width = 6, height = 4)
+gene_stats %>% arrange(desc(total)) %>% head(20)  # dominating genes (MT-, rRNA?)
+
+###############################################################################
+# Q4. Pre-processing: annotation, filtering, normalization, transformation
+###############################################################################
+## 4a. Remove X/Y-chromosome genes (as in the paper; sex is ~5:1 male)
+if (requireNamespace("EnsDb.Hsapiens.v75", quietly = TRUE)) {   # = GRCh37 E75, as in paper
+  gi  <- ensembldb::genes(EnsDb.Hsapiens.v75::EnsDb.Hsapiens.v75)
+  chr <- as.character(GenomicRanges::seqnames(gi))[match(rownames(counts), gi$gene_id)]
+  table(chr %in% c("X", "Y"))
+  counts_auto <- counts[!(chr %in% c("X", "Y")), ]
+} else counts_auto <- counts
+
+## 4b. Remove outlier samples decided in Q3 (EDIT this vector and justify it)
+drop_samples <- character(0)   # e.g. c("GSM2xxxxxx")
+counts_qc <- counts_auto[, !colnames(counts_auto) %in% drop_samples]
+meta_qc   <- droplevels(meta[colnames(counts_qc), ])
+
+## 4c. Filter lowly expressed genes (edgeR::filterByExpr, grouped by region x diagnosis)
+grp  <- interaction(meta_qc$region, meta_qc$diagnosis)
+keep <- filterByExpr(counts_qc, group = grp, min.count = 10)
+table(keep)
+counts_f <- counts_qc[keep, ]
+
+# Before/after density plot of log-CPM
+dens <- function(m, lab) as_tibble(cpm(m, log = TRUE, prior.count = 1)[, 1:30]) %>%
+  pivot_longer(everything()) %>% mutate(step = lab)
+bind_rows(dens(counts_qc, "before filtering"), dens(counts_f, "after filtering")) %>%
+  ggplot(aes(value, group = name)) + geom_density(alpha = .3) + facet_wrap(~step) +
+  labs(x = "log2 CPM", title = "Effect of low-count filtering (30 samples shown)")
+ggsave("figures/Q4_filtering.png", width = 9, height = 4)
+
+## 4d. Normalization (DESeq2 median-of-ratios) + variance-stabilizing transform
+dds <- DESeqDataSetFromMatrix(countData = round(counts_f), colData = meta_qc,
+                              design = ~ region + diagnosis)
+dds <- estimateSizeFactors(dds)
+summary(sizeFactors(dds))
+plot(sizeFactors(dds), colSums(counts_f) / 1e6,
+     xlab = "DESeq2 size factor", ylab = "Library size (M)")
+
+vsd <- vst(dds, blind = TRUE)          # blind = TRUE: unbiased by design for QC
+vmat <- assay(vsd)
+
+# Mean-variance before/after transformation
+raw_norm <- counts(dds, normalized = TRUE)
+mv <- bind_rows(
+  tibble(mean = rowMeans(log2(raw_norm + 1)), sd = rowSds(log2(raw_norm + 1)), data = "log2(norm + 1)"),
+  tibble(mean = rowMeans(vmat), sd = rowSds(vmat), data = "VST"))
+ggplot(mv, aes(rank(mean), sd)) + geom_point(alpha = .05, size = .3) +
+  geom_smooth(colour = "red") + facet_wrap(~data) + labs(x = "rank(mean)")
+ggsave("figures/Q4_mean_sd.png", width = 9, height = 4)
+
+# Boxplots of samples: raw vs normalized + transformed
+bind_rows(
+  as_tibble(log2(counts_f[, 1:40] + 1)) %>% pivot_longer(everything()) %>% mutate(step = "log2 raw"),
+  as_tibble(vmat[, 1:40]) %>% pivot_longer(everything()) %>% mutate(step = "VST normalized")) %>%
+  ggplot(aes(name, value)) + geom_boxplot(outlier.shape = NA) + facet_wrap(~step, ncol = 1) +
+  theme(axis.text.x = element_blank()) + labs(x = "sample (first 40)")
+ggsave("figures/Q4_boxplots.png", width = 9, height = 6)
+
+###############################################################################
+# Q5. Do samples cluster by biology or by a technical factor?
+###############################################################################
+run_pca <- function(mat, md, ntop = 500) {
+  sel <- head(order(rowVars(mat), decreasing = TRUE), ntop)
+  pc  <- prcomp(t(mat[sel, ]))
+  list(pc = pc, var = round(100 * pc$sdev^2 / sum(pc$sdev^2), 1),
+       df = bind_cols(md, as_tibble(pc$x[, 1:10])))
+}
+
+## 5a. All samples
+pca_all <- run_pca(vmat, meta_qc %>% left_join(select(qc, sample, lib_size, n_detected), by = "sample"))
+pa <- ggplot(pca_all$df, aes(PC1, PC2, colour = region)) + geom_point() +
+  labs(x = paste0("PC1 (", pca_all$var[1], "%)"), y = paste0("PC2 (", pca_all$var[2], "%)"))
+pb <- ggplot(pca_all$df, aes(PC1, PC2, colour = diagnosis)) + geom_point()
+pc_ <- ggplot(pca_all$df, aes(PC1, PC2, colour = log10(lib_size))) + geom_point() +
+  scale_colour_viridis_c()
+pd <- ggplot(pca_all$df, aes(PC1, PC2, colour = sex)) + geom_point()
+(pa | pb) / (pc_ | pd)
+ggsave("figures/Q5_pca_all.png", width = 11, height = 8)
+
+## 5b. Association of top PCs with every covariate (biological + technical)
+covs <- intersect(c("region", "diagnosis", "sex", "race", "age", "ph", "pmi",
+                    "lib_size", "n_detected"), names(pca_all$df))
+assoc <- expand_grid(PC = paste0("PC", 1:10), cov = covs) %>%
+  rowwise() %>%
+  mutate(p = {
+    x <- pca_all$df[[cov]]; y <- pca_all$df[[PC]]
+    if (is.numeric(x)) cor.test(x, y, method = "spearman", exact = FALSE)$p.value
+    else kruskal.test(y ~ factor(x))$p.value
+  }) %>% ungroup() %>% mutate(PC = factor(PC, paste0("PC", 1:10)))
+ggplot(assoc, aes(PC, cov, fill = -log10(p))) + geom_tile() +
+  geom_text(aes(label = ifelse(p < 0.05, "*", "")), size = 5) +
+  scale_fill_viridis_c() + labs(title = "PC-covariate association (* p < 0.05)", y = NULL)
+ggsave("figures/Q5_pc_covariate_assoc.png", width = 8, height = 4.5)
+
+## 5c. Within each region (region dominates, so look inside it)
+plots <- lapply(levels(meta_qc$region), function(r) {
+  idx <- meta_qc$region == r
+  p   <- run_pca(vmat[, idx], meta_qc[idx, ])
+  ggplot(p$df, aes(PC1, PC2, colour = diagnosis)) + geom_point() +
+    stat_ellipse(level = .68) +
+    labs(title = r, x = paste0("PC1 (", p$var[1], "%)"), y = paste0("PC2 (", p$var[2], "%)"))
+})
+wrap_plots(plots, ncol = 3)
+ggsave("figures/Q5_pca_by_region.png", width = 14, height = 4.5)
+
+## 5d. Hierarchical clustering (Ward, Euclidean — as in the paper)
+sel <- head(order(rowVars(vmat), decreasing = TRUE), 1000)
+hc  <- hclust(dist(t(vmat[sel, ])), method = "ward.D2")
+pheatmap(vmat[sel, ], scale = "row", cluster_cols = hc, annotation_col = ann[colnames(vmat), ],
+         show_rownames = FALSE, show_colnames = FALSE,
+         main = "Top 1000 variable genes (row z-scores)",
+         filename = "figures/Q5_heatmap_clusters.png", width = 10, height = 8)
+table(cluster = cutree(hc, k = 3), region = meta_qc$region)
+
+## 5e. Visualisation-only correction for technical covariates
+# (Never feed these corrected values into DESeq2 — covariates go in the design.)
+tech <- model.matrix(~ scale(log(colSums(counts_f))) + ph + pmi + age, data = meta_qc)[, -1]
+vmat_corr <- removeBatchEffect(vmat, covariates = tech,
+                               design = model.matrix(~ region + diagnosis, meta_qc))
+pca_corr <- run_pca(vmat_corr, meta_qc)
+ggplot(pca_corr$df, aes(PC1, PC2, colour = region, shape = diagnosis)) + geom_point() +
+  labs(title = "PCA after regressing out technical covariates (visualisation only)")
+ggsave("figures/Q5_pca_corrected.png", width = 7, height = 5)
+
+###############################################################################
+# Q6. Is the preprocessed dataset suitable for the next parts?
+###############################################################################
+# Design balance per region (power) and confounding of covariates with diagnosis
+table(meta_qc$region, meta_qc$diagnosis)
+for (v in intersect(c("age", "ph", "pmi"), names(meta_qc)))
+  print(c(v, signif(kruskal.test(meta_qc[[v]] ~ meta_qc$diagnosis)$p.value, 3)))
+chisq.test(table(meta_qc$diagnosis, meta_qc$sex), simulate.p.value = TRUE)
+
+# Save the analysis-ready objects
+saveRDS(list(counts = counts_f, meta = meta_qc, dds = dds, vsd = vsd),
+        "GSE80655_preprocessed.rds")
+sessionInfo()
+
+```
+
