@@ -44,8 +44,8 @@ dir.create("figures", showWarnings = FALSE)
 ```{r read}
 # CHANGED: relative paths, so the script works on every computer.
 # The two csv files must be in the same folder as this .Rmd file.
-counts_raw <- read.csv("GSE80655_counts.csv",   check.names = FALSE)
-meta_raw   <- read.csv("GSE80655_metadata.csv", check.names = FALSE,
+counts_raw <- read.csv("/Users/victoria/Documents/GitHub/Group 35/Data/GSE80655_counts.csv",   check.names = FALSE)
+meta_raw   <- read.csv("/Users/victoria/Documents/GitHub/Group 35/Data/GSE80655_metadata.csv", check.names = FALSE,
                        stringsAsFactors = FALSE)
 
 # Counts: first column = gene IDs, keep only numeric (sample) columns
